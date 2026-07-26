@@ -66,6 +66,14 @@ hiddenimports: list[str] = [
     "setuptools._distutils.dir_util",
     "setuptools._distutils.file_util",
     "setuptools._distutils.archive_util",
+    "twitch",
+    "gui",
+    "channel",
+    "websocket",
+    "inventory",
+    "cache",
+    "registry",
+    "aiohttp",
 ]
 
 if sys.platform == "linux":
