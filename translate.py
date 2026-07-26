@@ -32,6 +32,7 @@ class LoginMessages(TypedDict):
     chrome: ChromeMessages
     error_code: str
     unexpected_content: str
+    unexpected_response: str
     email_code_required: str
     twofa_code_required: str
     incorrect_login_pass: str
@@ -249,6 +250,9 @@ default_translation: Translation = {
         "unexpected_content": (
             "Unexpected content type returned, usually due to being redirected. "
             "Do you need to login for internet access?"
+        ),
+        "unexpected_response": (
+            "Unexpected server response received. Retrying..."
         ),
         "chrome": {
             "startup": "Opening Chrome...",

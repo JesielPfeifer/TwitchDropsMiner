@@ -200,6 +200,8 @@ class _AuthState:
 
         token_kind: str = ''
         use_chrome: bool = False
+        twofa_attempts: int = 0
+        MAX_TWOFA_ATTEMPTS: Final[int] = 10
         payload: JsonType = {
             # username and password are added later
             # "username": str,
@@ -230,6 +232,7 @@ class _AuthState:
                     payload["authy_token"] = login_data.token
                 elif token_kind == "email":
                     payload["twitchguard_code"] = login_data.token
+                twofa_attempts += 1
 
             # use fancy headers to mimic the twitch android app
             headers = {
@@ -246,7 +249,12 @@ class _AuthState:
             async with self._twitch.request(
                 "POST", "https://passport.twitch.tv/login", headers=headers, json=payload
             ) as response:
-                login_response: JsonType = await response.json(loads=SAFE_LOADS)
+                try:
+                    login_response: JsonType = await response.json(loads=SAFE_LOADS)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    logger.info("Login response was not valid JSON")
+                    gui_print(_("login", "unexpected_response"))
+                    continue
 
             # Feed this back in to avoid running into CAPTCHA if possible
             if "captcha_proof" in login_response:
@@ -294,6 +302,10 @@ class _AuthState:
                     else:
                         token_kind = "authy"
                         gui_print(_("login", "twofa_code_required"))
+                    if twofa_attempts >= MAX_TWOFA_ATTEMPTS:
+                        logger.info("Too many 2FA attempts, switching to chrome flow")
+                        use_chrome = True
+                        break
                     continue
                 elif error_code >= 5000:
                     # Special errors, usually from Twitch telling the user to "go away"
@@ -322,6 +334,10 @@ class _AuthState:
                 logger.info("Access token granted")
                 login_form.clear()
                 break
+
+            # Unexpected response: no error_code and no access_token
+            logger.info(f"Unexpected login response: {login_response}")
+            gui_print(_("login", "unexpected_response"))
 
         if use_chrome:
             # await self._chrome_login()
@@ -895,67 +911,73 @@ class Twitch:
     async def _watch_loop(self) -> NoReturn:
         interval: float = WATCH_INTERVAL.total_seconds()
         while True:
-            channel: Channel = await self.watching_channel.get()
-            if not channel.online:
-                # if the channel isn't online anymore, we stop watching it
-                self.stop_watching()
-                continue
-            # logger.log(CALL, f"Sending watch payload to: {channel.name}")
-            succeeded: bool = await channel.send_watch()
-            last_sent: float = time()
-            if not succeeded:
-                logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
-            # wait ~20 seconds for a progress update
-            await asyncio.sleep(20)
-            if self.gui.progress.minute_almost_done():
-                # If the previous update was more than ~60s ago, and the progress tracker
-                # isn't counting down anymore, that means Twitch has temporarily
-                # stopped reporting drop's progress. To ensure the timer keeps at least somewhat
-                # accurate time, we can use GQL to query for the current drop,
-                # or even "pretend" mining as a last resort option.
-                handled: bool = False
+            try:
+                channel: Channel = await self.watching_channel.get()
+                if not channel.online:
+                    # if the channel isn't online anymore, we stop watching it
+                    self.stop_watching()
+                    continue
+                # logger.log(CALL, f"Sending watch payload to: {channel.name}")
+                succeeded: bool = await channel.send_watch()
+                last_sent: float = time()
+                if not succeeded:
+                    logger.log(CALL, f"Watch requested failed for channel: {channel.name}")
+                # wait ~20 seconds for a progress update
+                await asyncio.sleep(20)
+                if self.gui.progress.minute_almost_done():
+                    # If the previous update was more than ~60s ago, and the progress tracker
+                    # isn't counting down anymore, that means Twitch has temporarily
+                    # stopped reporting drop's progress. To ensure the timer keeps at least somewhat
+                    # accurate time, we can use GQL to query for the current drop,
+                    # or even "pretend" mining as a last resort option.
+                    handled: bool = False
 
-                # Solution 1: use GQL to query for the currently mined drop status
-                try:
-                    context = await self.gql_request(
-                        GQL_QUERIES["CurrentDrop"].with_variables(
-                            {"channelID": str(channel.id)}
-                        )
-                    )
-                    drop_data: JsonType | None = (
-                        context["data"]["currentUser"]["dropCurrentSession"]
-                    )
-                except GQLException:
-                    drop_data = None
-                if drop_data is not None:
-                    gql_drop: TimedDrop | None = self._drops.get(drop_data["dropID"])
-                    if gql_drop is not None and gql_drop.can_earn(channel):
-                        gql_drop.update_minutes(drop_data["currentMinutesWatched"])
-                        drop_text: str = (
-                            f"{gql_drop.name} ({gql_drop.campaign.game}, "
-                            f"{gql_drop.current_minutes}/{gql_drop.required_minutes})"
-                        )
-                        logger.log(CALL, f"Drop progress from GQL: {drop_text}")
-                        handled = True
-
-                # Solution 2: If GQL fails, figure out which campaign we're most likely mining
-                # right now, and then bump up the minutes on it's drops
-                if not handled:
-                    if (active_campaign := self.get_active_campaign(channel)) is not None:
-                        active_campaign.bump_minutes(channel)
-                        # NOTE: This usually gets overwritten below
-                        drop_text = f"Unknown drop ({active_campaign.game})"
-                        if (active_drop := active_campaign.first_drop) is not None:
-                            active_drop.display()
-                            drop_text = (
-                                f"{active_drop.name} ({active_drop.campaign.game}, "
-                                f"{active_drop.current_minutes}/{active_drop.required_minutes})"
+                    # Solution 1: use GQL to query for the currently mined drop status
+                    try:
+                        context = await self.gql_request(
+                            GQL_QUERIES["CurrentDrop"].with_variables(
+                                {"channelID": str(channel.id)}
                             )
-                        logger.log(CALL, f"Drop progress from active search: {drop_text}")
-                        handled = True
-                    else:
-                        logger.log(CALL, "No active drop could be determined")
-            await self._watch_sleep(interval - min(time() - last_sent, interval))
+                        )
+                        drop_data: JsonType | None = (
+                            context["data"]["currentUser"]["dropCurrentSession"]
+                        )
+                    except GQLException:
+                        drop_data = None
+                    if drop_data is not None:
+                        gql_drop: TimedDrop | None = self._drops.get(drop_data["dropID"])
+                        if gql_drop is not None and gql_drop.can_earn(channel):
+                            gql_drop.update_minutes(drop_data["currentMinutesWatched"])
+                            drop_text: str = (
+                                f"{gql_drop.name} ({gql_drop.campaign.game}, "
+                                f"{gql_drop.current_minutes}/{gql_drop.required_minutes})"
+                            )
+                            logger.log(CALL, f"Drop progress from GQL: {drop_text}")
+                            handled = True
+
+                    # Solution 2: If GQL fails, figure out which campaign we're most likely mining
+                    # right now, and then bump up the minutes on it's drops
+                    if not handled:
+                        if (active_campaign := self.get_active_campaign(channel)) is not None:
+                            active_campaign.bump_minutes(channel)
+                            # NOTE: This usually gets overwritten below
+                            drop_text = f"Unknown drop ({active_campaign.game})"
+                            if (active_drop := active_campaign.first_drop) is not None:
+                                active_drop.display()
+                                drop_text = (
+                                    f"{active_drop.name} ({active_drop.campaign.game}, "
+                                    f"{active_drop.current_minutes}/{active_drop.required_minutes})"
+                                )
+                            logger.log(CALL, f"Drop progress from active search: {drop_text}")
+                            handled = True
+                        else:
+                            logger.log(CALL, "No active drop could be determined")
+                await self._watch_sleep(interval - min(time() - last_sent, interval))
+            except (ExitRequest, ReloadRequest):
+                raise
+            except Exception:
+                logger.exception("Non-fatal error in watch loop, retrying...")
+                await asyncio.sleep(interval)
 
     @task_wrapper(critical=True)
     async def _maintenance_task(self) -> None:
@@ -1166,17 +1188,21 @@ class Twitch:
         msg_type: str = message["type"]
         if msg_type not in ("drop-progress", "drop-claim"):
             return
-        drop_id: str = message["data"]["drop_id"]
+        data: JsonType | None = message.get("data")
+        if not data or "drop_id" not in data:
+            logger.error(f"Received an invalid drops message without drop_id: {message}")
+            return
+        drop_id: str = data["drop_id"]
         drop: TimedDrop | None = self._drops.get(drop_id)
         watching_channel: Channel | None = self.watching_channel.get_with_default(None)
         if msg_type == "drop-claim":
             if drop is None:
                 logger.error(
                     f"Received a drop claim ID for a non-existing drop: {drop_id}\n"
-                    f"Drop claim ID: {message['data']['drop_instance_id']}"
+                    f"Drop claim ID: {data.get('drop_instance_id', 'N/A')}"
                 )
                 return
-            drop.update_claim(message["data"]["drop_instance_id"])
+            drop.update_claim(data["drop_instance_id"])
             campaign = drop.campaign
             await drop.claim()
             drop.display()
@@ -1186,14 +1212,21 @@ class Twitch:
             await asyncio.sleep(4)
             if watching_channel is not None:
                 for attempt in range(8):
-                    context = await self.gql_request(
-                        GQL_QUERIES["CurrentDrop"].with_variables(
-                            {"channelID": str(watching_channel.id)}
+                    try:
+                        context = await self.gql_request(
+                            GQL_QUERIES["CurrentDrop"].with_variables(
+                                {"channelID": str(watching_channel.id)}
+                            )
                         )
-                    )
-                    drop_data: JsonType | None = (
-                        context["data"]["currentUser"]["dropCurrentSession"]
-                    )
+                        drop_data: JsonType | None = (
+                            context["data"]["currentUser"]["dropCurrentSession"]
+                        )
+                    except GQLException:
+                        logger.error(
+                            "GQL failed during drop claim verification, "
+                            "breaking out of polling loop"
+                        )
+                        break
                     if drop_data is None or drop_data["dropID"] != drop.id:
                         break
                     await asyncio.sleep(2)
@@ -1206,15 +1239,15 @@ class Twitch:
         if drop is not None:
             drop_text = (
                 f"{drop.name} ({drop.campaign.game}, "
-                f"{message['data']['current_progress_min']}/"
-                f"{message['data']['required_progress_min']})"
+                f"{data.get('current_progress_min', 0)}/"
+                f"{data.get('required_progress_min', 0)})"
             )
         else:
             drop_text = "<Unknown>"
         logger.log(CALL, f"Drop update from websocket: {drop_text}")
         if drop is not None and drop.can_earn(self.watching_channel.get_with_default(None)):
             # the received payload is for the drop we expected
-            drop.update_minutes(message["data"]["current_progress_min"])
+            drop.update_minutes(data["current_progress_min"])
 
     @task_wrapper
     async def process_notifications(self, user_id: int, message: JsonType):

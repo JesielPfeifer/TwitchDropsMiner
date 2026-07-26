@@ -491,7 +491,7 @@ class Channel:
                 "POST", self._spade_url, data=self._stream.spade_payload
             ) as response:
                 return response.status == 204
-        except RequestException:
+        except (RequestException, aiohttp.ClientConnectorCertificateError):
             return False
 
     # NOTE: This is currently unused.
@@ -501,5 +501,5 @@ class Channel:
         try:
             watch_response = await self._twitch.gql_request(self._stream.gql_payload)
             return watch_response["data"]["sendSpadeEvents"]["statusCode"] == 204
-        except RequestException:
+        except (RequestException, aiohttp.ClientConnectorCertificateError):
             return False
