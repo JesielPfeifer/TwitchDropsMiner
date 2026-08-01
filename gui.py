@@ -2042,6 +2042,8 @@ class SettingsPanel:
             if mode_name == name:
                 self._settings.priority_mode = value
                 break
+        self._settings.alter()
+        self._twitch.change_state(State.INVENTORY_FETCH)
 
     def exclude_add(self) -> None:
         game_name: str = self._exclude_entry.get()
