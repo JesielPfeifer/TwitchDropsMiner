@@ -36,7 +36,7 @@ default_settings: SettingsFile = {
     "tray_notifications": True,
     "enable_badges_emotes": False,
     "available_drops_check": False,
-    "priority_mode": PriorityMode.PRIORITY_ONLY,
+        "priority_mode": PriorityMode.ENDING_SOONEST,
 }
 
 
@@ -68,6 +68,13 @@ class Settings:
         self._settings: SettingsFile = json_load(SETTINGS_PATH, default_settings)
         self._args: ParsedArgs = args
         self._altered: bool = False
+        # migrate existing users from PRIORITY_ONLY with empty priority list
+        if (
+            self._settings["priority_mode"] is PriorityMode.PRIORITY_ONLY
+            and not self._settings["priority"]
+        ):
+            self._settings["priority_mode"] = PriorityMode.ENDING_SOONEST
+            self._altered = True
 
     # default logic of reading settings is to check args first, then the settings file
     def __getattr__(self, name: str, /) -> Any:

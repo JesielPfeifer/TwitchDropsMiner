@@ -694,17 +694,39 @@ class Twitch:
                 )
                 for campaign in sorted_campaigns:
                     game: Game = campaign.game
-                    if (
-                        game not in self.wanted_games  # isn't already there
-                        # and isn't excluded by list or priority mode
-                        and game.name not in exclude
-                        and (not priority_only or game.name in priority)
-                        # and can be progressed within the next hour
-                        and campaign.can_earn_within(next_hour)
-                    ):
-                        # non-excluded games with no priority are placed last, below priority ones
-                        self.wanted_games.append(game)
+                    if game in self.wanted_games:
+                        continue
+                    if game.name in exclude:
+                        self.print(f"[DEBUG] Skipping '{game.name}': excluded by user")
+                        continue
+                    if priority_only and game.name not in priority:
+                        self.print(f"[DEBUG] Skipping '{game.name}': not in priority list (PRIORITY_ONLY mode)")
+                        continue
+                    can_earn = campaign.can_earn_within(next_hour)
+                    if not can_earn:
+                        reason_parts = []
+                        if not campaign.eligible:
+                            reason_parts.append(f"not eligible (linked={campaign.linked}, badge_emote={campaign.has_badge_or_emote})")
+                        if not campaign._valid:
+                            reason_parts.append("marked EXPIRED")
+                        if campaign.ends_at <= datetime.now(timezone.utc):
+                            reason_parts.append("already ended")
+                        if campaign.starts_at >= next_hour:
+                            reason_parts.append(f"starts at {campaign.starts_at:%H:%M}")
+                        earnable_drops = [d for d in campaign.drops if d._can_earn_within(next_hour)]
+                        if not earnable_drops:
+                            claimed = sum(1 for d in campaign.drops if d.is_claimed)
+                            reason_parts.append(f"no earnable drops ({claimed}/{campaign.total_drops} claimed)")
+                        reason = ", ".join(reason_parts) if reason_parts else "unknown"
+                        self.print(f"[DEBUG] Skipping '{game.name}': {reason}")
+                        continue
+                    # non-excluded games with no priority are placed last, below priority ones
+                    self.wanted_games.append(game)
                 full_cleanup = True
+                if self.wanted_games:
+                    self.print(f"[DEBUG] wanted_games: {[g.name for g in self.wanted_games]}")
+                else:
+                    self.print("[DEBUG] wanted_games is EMPTY - no campaigns selected for mining")
                 self.restart_watching()
                 self.change_state(State.CHANNELS_CLEANUP)
             elif self._state is State.CHANNELS_CLEANUP:
@@ -768,16 +790,26 @@ class Twitch:
                             acl_channels.update(campaign.allowed_channels)
                         else:
                             no_acl.add(campaign.game)
+                self.print(f"[DEBUG] ACL channels: {len(acl_channels)}, games without ACL: {len(no_acl)} ({[g.name for g in no_acl]})")
                 # remove all ACL channels that already exist from the other set
                 acl_channels.difference_update(new_channels)
                 # use the other set to set them online if possible
                 await self.bulk_check_online(acl_channels)
+                self.print(f"[DEBUG] ACL channels online after check: {sum(1 for ch in acl_channels if ch.online)}/{len(acl_channels)}")
                 # finally, add them as new channels
                 new_channels.update(acl_channels)
                 for game in no_acl:
                     # for every campaign without an ACL, for it's game,
                     # add a list of live channels with drops enabled
-                    new_channels.update(await self.get_live_streams(game, drops_enabled=True))
+                    try:
+                        live_streams = await self.get_live_streams(game, drops_enabled=True)
+                    except MinerException:
+                        logger.error(f"get_live_streams failed for '{game.name}', skipping")
+                        self.print(f"[DEBUG] get_live_streams for '{game.name}': failed, skipping")
+                        continue
+                    self.print(f"[DEBUG] get_live_streams for '{game.name}': got {len(live_streams)} channels")
+                    new_channels.update(live_streams)
+                self.print(f"[DEBUG] Total candidate channels before sort: {len(new_channels)}")
                 # sort them descending by viewers, by priority and by game priority
                 # NOTE: Viewers sort also ensures ONLINE channels are sorted to the top
                 # NOTE: We can drop using the set now, because there's no more channels being added
@@ -1465,6 +1497,7 @@ class Twitch:
             for c in available_list
             if c["status"] in applicable_statuses  # that are currently not expired
         }
+        self.print(f"[DEBUG] fetch_inventory: {len(ongoing_campaigns)} in-progress, {len(available_campaigns)} available (ACTIVE/UPCOMING)")
         # fetch detailed data for each campaign, in chunks
         status_update(_("gui", "status", "fetching_campaigns"))
         fetch_campaigns_tasks: list[asyncio.Task[Any]] = [
@@ -1515,6 +1548,7 @@ class Twitch:
             DropsCampaign(self, campaign_data, claimed_benefits)
             for campaign_data in inventory_data.values()
         ]
+        self.print(f"[DEBUG] fetch_inventory: created {len(campaigns)} campaign objects from {len(inventory_data)} raw items")
         campaigns.sort(key=lambda c: c.active, reverse=True)
         campaigns.sort(key=lambda c: c.upcoming and c.starts_at or c.ends_at)
         campaigns.sort(key=lambda c: c.eligible, reverse=True)
@@ -1601,7 +1635,9 @@ class Twitch:
                 })
             )
         except GQLException as exc:
-            raise MinerException(f"Game: {game.slug}") from exc
+            raise MinerException(
+                f"Failed to fetch live streams for {game.name} ({game.slug})"
+            ) from exc
         if "game" in response["data"]:
             return [
                 Channel.from_directory(
