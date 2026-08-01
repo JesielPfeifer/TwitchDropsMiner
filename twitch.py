@@ -801,10 +801,15 @@ class Twitch:
                 for game in no_acl:
                     # for every campaign without an ACL, for it's game,
                     # add a list of live channels with drops enabled
-                    live_streams = await self.get_live_streams(game, drops_enabled=True)
+                    try:
+                        live_streams = await self.get_live_streams(game, drops_enabled=True)
+                    except MinerException:
+                        logger.error(f"get_live_streams failed for '{game.name}', skipping")
+                        self.print(f"[DEBUG] get_live_streams for '{game.name}': failed, skipping")
+                        continue
                     self.print(f"[DEBUG] get_live_streams for '{game.name}': got {len(live_streams)} channels")
                     new_channels.update(live_streams)
-                self.print(f"[DEBUG] Total new channels before sort: {len(new_channels)}")
+                self.print(f"[DEBUG] Total candidate channels before sort: {len(new_channels)}")
                 # sort them descending by viewers, by priority and by game priority
                 # NOTE: Viewers sort also ensures ONLINE channels are sorted to the top
                 # NOTE: We can drop using the set now, because there's no more channels being added
@@ -1630,8 +1635,9 @@ class Twitch:
                 })
             )
         except GQLException as exc:
-            logger.error(f"get_live_streams failed for '{game.name}' (slug={game.slug}): {exc}")
-            return []
+            raise MinerException(
+                f"Failed to fetch live streams for {game.name} ({game.slug})"
+            ) from exc
         if "game" in response["data"]:
             return [
                 Channel.from_directory(
